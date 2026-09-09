@@ -58,34 +58,63 @@ OUT_HTML = os.path.join(HERE, "dashboard.html")
 
 def _clean(sym): return str(sym).strip().upper().replace(".", "-")
 
+UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+      "Accept": "text/html,application/xhtml+xml,text/csv,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9"}
+WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+WIKI_SP600 = "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
+# Backup S&P 500 list (GitHub-hosted, always reachable from servers)
+SP500_FALLBACK = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+
+
+def _fetch_text(url, timeout=60):
+    """GET a URL with a browser-like User-Agent (Wikipedia 403s bare requests)."""
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
 
 def _wiki_symbols(url, cols=("Symbol", "Ticker", "Ticker symbol")):
-    for tbl in pd.read_html(url):
+    for tbl in pd.read_html(io.StringIO(_fetch_text(url))):
         for c in cols:
             if c in tbl.columns:
                 return sorted({_clean(s) for s in tbl[c].tolist() if isinstance(s, str)})
     raise RuntimeError(f"No symbol column at {url}")
 
 
+def _sp500_fallback_df():
+    return pd.read_csv(io.StringIO(_fetch_text(SP500_FALLBACK)))
+
+
 def fetch_sp500_tickers():
-    return _wiki_symbols("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+    try:
+        return _wiki_symbols(WIKI_SP500)
+    except Exception as e:
+        print(f"    warn: Wikipedia S&P 500 list failed ({e}); using backup list")
+        df = _sp500_fallback_df()
+        return sorted({_clean(s) for s in df["Symbol"].tolist() if isinstance(s, str)})
 
 
 def fetch_sp600_tickers():
-    return _wiki_symbols("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
+    return _wiki_symbols(WIKI_SP600)
 
 
 def fetch_sp500_sectors():
-    try:
-        df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        sym = "Symbol" if "Symbol" in df.columns else df.columns[0]
-        sec = next((c for c in df.columns if "Sector" in str(c)), None)
-        if sec is None:
-            return {}
-        return {_clean(s): str(x) for s, x in zip(df[sym], df[sec]) if isinstance(s, str)}
-    except Exception as e:
-        print(f"    warn: sector map failed ({e})")
-        return {}
+    for source in ("wiki", "fallback"):
+        try:
+            if source == "wiki":
+                df = pd.read_html(io.StringIO(_fetch_text(WIKI_SP500)))[0]
+            else:
+                df = _sp500_fallback_df()
+            sym = "Symbol" if "Symbol" in df.columns else df.columns[0]
+            sec = next((c for c in df.columns if "Sector" in str(c)), None)
+            if sec is None:
+                continue
+            return {_clean(s): str(x) for s, x in zip(df[sym], df[sec]) if isinstance(s, str)}
+        except Exception as e:
+            print(f"    warn: sector map via {source} failed ({e})")
+    return {}
 
 
 def fetch_nasdaq_tickers():
@@ -337,6 +366,7 @@ class Breadth:
     net_new_highs: float; mcclellan_osc: float; mcclellan_sum: float
     thrust_ratio: float; thrust_signal: bool
     score: float = 0.0; regime: str = ""
+    key: str = ""; color: str = "var(--series-1)"
     series_pct200: list = field(default_factory=list)
     series_pct50: list = field(default_factory=list)
     series_adline: list = field(default_factory=list)
@@ -686,9 +716,9 @@ def render_body(indexes, risk, history, generated, note, sectors, backtest=None)
             {tile("McClellan Summation", f"{b.mcclellan_sum:+.0f}", "long-term breadth tide", series=b.series_mcsum, zero=True, color=color)}
           </div><div class="subscores"><div class="subtitle">Composite components (0–100)</div>{bars}</div></section>"""
 
-    cards = "".join(card(b, s["color"]) for b, s in zip(indexes, INDEX_SPECS))
-    mini = "".join(f'<div><span class="mk" style="background:{s["color"]}"></span>{b.name} <b>{b.score:.0f}</b> · {b.regime}</div>'
-                   for b, s in zip(indexes, INDEX_SPECS))
+    cards = "".join(card(b, b.color) for b in indexes)
+    mini = "".join(f'<div><span class="mk" style="background:{b.color}"></span>{b.name} <b>{b.score:.0f}</b> · {b.regime}</div>'
+                   for b in indexes)
 
     # sector heatmap
     sec_html = ""
@@ -719,7 +749,7 @@ def render_body(indexes, risk, history, generated, note, sectors, backtest=None)
       </div></section>"""
 
     toggles = "".join(f'<button class="tgl{" active" if k=="Overall" else ""}" data-k="{k}">{k}</button>'
-                      for k in ["Overall", "S&P 500", "NASDAQ", "Small Caps"])
+                      for k in history["series"].keys())
     hist_html = f"""<section class="card"><div class="cardhead"><div><h2>Track record — breadth composite vs. S&amp;P 500</h2>
       <div class="muted">~2 years. Colored bands are the regime zones. Toggle the composite; hover for values.</div></div>
       <div class="toggles">{toggles}</div></div>
@@ -996,8 +1026,8 @@ def _history(indexes, hist, price):
     def col(s): return [None if pd.isna(x) else round(float(x), 1) for x in s.reindex(common).ffill()]
     series = {"Overall": [None if pd.isna(x) else round(float(x), 1) for x in hist]}
     names = {"sp500": "S&P 500", "nasdaq": "NASDAQ", "sp600": "Small Caps"}
-    for b, spec in zip(indexes, INDEX_SPECS):
-        series[names[spec["key"]]] = col(b.score_ts)
+    for b in indexes:
+        series[names.get(b.key, b.name)] = col(b.score_ts)
     if price is not None:
         pr = price.reindex(common, method="ffill")
         pcol = [None if pd.isna(x) else round(float(x), 2) for x in pr]
@@ -1012,10 +1042,10 @@ def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
     period = f"{max(int(years), 2)}y"
     if demo:
         print("DEMO mode: synthetic data (no network).")
-        for name, sub, nn, seed, drift in [("S&P 500", "Large cap", 120, 1, 0.0009),
-                                           ("NASDAQ Composite", "Tech / growth", 160, 2, 0.0006),
-                                           ("Small Caps (S&P 600)", "Small cap", 140, 3, 0.0003)]:
-            indexes.append(compute_breadth(demo_closes(nn, seed, drift), name, sub))
+        for spec, (nn, seed, drift) in zip(INDEX_SPECS, [(120, 1, 0.0009), (160, 2, 0.0006), (140, 3, 0.0003)]):
+            b = compute_breadth(demo_closes(nn, seed, drift), spec["name"], spec["sub"])
+            b.key, b.color = spec["key"], spec["color"]
+            indexes.append(b)
         price = demo_price()
         rng = np.random.default_rng(5)
         secs = ["Information Technology", "Financials", "Health Care", "Consumer Discretionary",
@@ -1028,18 +1058,25 @@ def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
     else:
         print("Fetching constituents ...")
         for spec in INDEX_SPECS:
-            tickers = spec["fetch"]()
-            print(f"  {spec['name']}: {len(tickers)} names")
-            if sample:
-                import random; random.seed(42)
-                tickers = sorted(random.sample(tickers, min(sample, len(tickers))))
-            closes = download_closes(tickers, spec["key"], refresh=refresh, period=period, source=source,
-                                     tiingo_key=tiingo_key, tv_user=tv_user, tv_pass=tv_pass)
-            indexes.append(compute_breadth(closes, spec["name"], spec["sub"]))
-            if spec["key"] == "sp500":
-                sm = fetch_sp500_sectors()
-                if sm:
-                    sectors = compute_sector_breadth(closes, sm)
+            try:
+                tickers = spec["fetch"]()
+                print(f"  {spec['name']}: {len(tickers)} names")
+                if sample:
+                    import random; random.seed(42)
+                    tickers = sorted(random.sample(tickers, min(sample, len(tickers))))
+                closes = download_closes(tickers, spec["key"], refresh=refresh, period=period, source=source,
+                                         tiingo_key=tiingo_key, tv_user=tv_user, tv_pass=tv_pass)
+                b = compute_breadth(closes, spec["name"], spec["sub"])
+                b.key, b.color = spec["key"], spec["color"]
+                indexes.append(b)
+                if spec["key"] == "sp500":
+                    sm = fetch_sp500_sectors()
+                    if sm:
+                        sectors = compute_sector_breadth(closes, sm)
+            except Exception as e:
+                print(f"  WARN: skipping {spec['name']} — {e}")
+        if not indexes:
+            raise RuntimeError("Could not build any index — every data source was blocked.")
         gspc = download_series("^GSPC", "gspc", refresh, period=f"{max(int(years) + 1, 3)}y")
         price = gspc.dropna().iloc[-(int(years) * 252 + 140):] if gspc is not None else None
         src = {"yahoo": "Yahoo Finance", "tiingo": "Tiingo", "tradingview": "TradingView"}.get(source, source)
