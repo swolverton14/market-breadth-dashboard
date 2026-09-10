@@ -119,7 +119,7 @@ def fetch_sp500_sectors():
 
 def fetch_nasdaq_tickers():
     url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=60) as r:
         raw = r.read().decode("utf-8", errors="replace")
     df = pd.read_csv(io.StringIO(raw), sep="|")
@@ -336,7 +336,7 @@ def fetch_fred_series(series_id, tag, refresh=False):
             pass
     try:
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers=UA)
         with urllib.request.urlopen(req, timeout=45) as r:
             df = pd.read_csv(io.StringIO(r.read().decode()))
         df.columns = ["date", "value"]
@@ -524,6 +524,7 @@ REGIME_META = {
 class RiskCtx:
     vix: float = None; vix_role: str = ""; vix_series: list = field(default_factory=list)
     hy: float = None; hy_role: str = ""; hy_series: list = field(default_factory=list)
+    hy_proxy: bool = False; hy_label: str = "BAML HY OAS · rising = risk-off"
     ewcw: float = None; ewcw_role: str = ""; ewcw_series: list = field(default_factory=list)
 
 
@@ -546,6 +547,18 @@ def build_risk(refresh=False, demo=False):
         hy = fetch_fred_series("BAMLH0A0HYM2", "hyoas", refresh)
         if hy is not None:
             h = hy.dropna().iloc[-252:]; r.hy = float(h.iloc[-1]); r.hy_series = _ser(h.index, h.values)
+        else:
+            # Fallback: HYG/IEF ratio (high-yield vs treasuries) as a credit-stress proxy.
+            # Rising ratio = spreads tightening (risk-on); falling = widening (risk-off).
+            print("    FRED unavailable — using HYG/IEF credit proxy")
+            hyg, ief = download_series("HYG", "hyg", refresh), download_series("IEF", "ief", refresh)
+            if hyg is not None and ief is not None:
+                ratio = (hyg / ief).dropna().iloc[-252:]
+                if len(ratio) > 51:
+                    r.hy = float((ratio.iloc[-1] / ratio.iloc[-51] - 1) * 100)
+                    r.hy_series = _ser(ratio.index, (ratio / ratio.iloc[0]).values)
+                    r.hy_proxy = True
+                    r.hy_label = "HYG/IEF credit proxy, 50-day · falling = risk-off"
         rsp, spy = download_series("RSP", "rsp", refresh), download_series("SPY", "spy", refresh)
         if rsp is not None and spy is not None:
             ratio = (rsp / spy).dropna().iloc[-252:]
@@ -555,7 +568,10 @@ def build_risk(refresh=False, demo=False):
     if r.vix is not None:
         r.vix_role = "good" if r.vix < 15 else "warning" if r.vix < 20 else "serious" if r.vix < 30 else "critical"
     if r.hy is not None:
-        r.hy_role = "good" if r.hy < 3.5 else "warning" if r.hy < 5 else "serious" if r.hy < 7 else "critical"
+        if r.hy_proxy:   # % change of HYG/IEF: up = good
+            r.hy_role = "good" if r.hy > 1 else "warning" if r.hy > -1 else "serious" if r.hy > -3 else "critical"
+        else:            # OAS spread level in %: low = good
+            r.hy_role = "good" if r.hy < 3.5 else "warning" if r.hy < 5 else "serious" if r.hy < 7 else "critical"
     if r.ewcw is not None:
         r.ewcw_role = "good" if r.ewcw > 1 else "warning" if r.ewcw > -1 else "serious" if r.ewcw > -4 else "critical"
     return r
@@ -744,7 +760,7 @@ def render_body(indexes, risk, history, generated, note, sectors, backtest=None)
       <div class="muted">Market-wide conditions around the breadth signal</div></div></div>
       <div class="tilegrid rg3">
         {rtile("VIX (volatility)", f"{risk.vix:.1f}" if risk.vix is not None else None, "&lt;15 calm · 20+ elevated · 30+ stress", risk.vix_role, risk.vix_series, "var(--series-4)")}
-        {rtile("High-yield credit spread", f"{risk.hy:.2f}%" if risk.hy is not None else None, "BAML HY OAS · rising = risk-off", risk.hy_role, risk.hy_series, "var(--series-4)")}
+        {rtile("High-yield credit" + (" (proxy)" if risk.hy_proxy else " spread"), (None if risk.hy is None else (f"{risk.hy:+.1f}%" if risk.hy_proxy else f"{risk.hy:.2f}%")), risk.hy_label, risk.hy_role, risk.hy_series, "var(--series-4)")}
         {rtile("Equal-wt vs cap-wt (50d)", f"{risk.ewcw:+.1f}%" if risk.ewcw is not None else None, "RSP/SPY · rising = broadening", risk.ewcw_role, risk.ewcw_series, "var(--series-3)")}
       </div></section>"""
 
@@ -786,7 +802,7 @@ def render_body(indexes, risk, history, generated, note, sectors, backtest=None)
     return f"""<div class="wrap">
   <header class="top"><div><h1>Market Breadth Dashboard</h1>
     <div class="muted">When to be more invested — and when not to. {note}</div></div>
-    <div class="stamp">Generated<br><b>{generated}</b></div></header>
+    <div class="stamp">{generated}</div></header>
   <section class="hero"><div class="herogauge">{_gauge(overall)}
     <div class="herolabel"><div class="heroscore" style="color:{_sv(o_role)}">{overall:.0f}<span>/100</span></div>
     <div class="heroregime" style="color:{_sv(o_role)}">{o_reg}</div></div></div>
@@ -1089,7 +1105,13 @@ def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
     hist = aligned.mean(axis=1)
     history = _history(indexes, hist, price)
     backtest = compute_backtest(history)
-    generated = dt.datetime.now().strftime("%a %b %d, %Y  %H:%M")
+    try:
+        from zoneinfo import ZoneInfo
+        ts = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%a %b %d, %Y %I:%M %p ET")
+    except Exception:
+        ts = dt.datetime.now().strftime("%a %b %d, %Y %H:%M")
+    data_through = history["dates"][-1] if history.get("dates") else "n/a"
+    generated = f"Data through<br><b>{data_through} close</b><br>built {ts}"
 
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(render_full(indexes, risk, history, generated, note, sectors, backtest))
