@@ -249,6 +249,21 @@ def _tiingo_closes(tickers, tag, key, period_days=730, pause=0.15):
     return df.dropna(axis=1, thresh=int(len(df) * 0.6))
 
 
+def _trim_sparse_tail(df, min_cov=0.5):
+    """Drop trailing days where most tickers have no close yet.
+    Yahoo often returns the current day's bar for only a fraction of symbols
+    until it finalizes; computing breadth on that row gives nan / tiny counts."""
+    if df is None or df.empty:
+        return df
+    cov = df.notna().mean(axis=1)
+    n = len(df)
+    while n > 1 and cov.iloc[n - 1] < min_cov:
+        n -= 1
+    if n < len(df):
+        print(f"    note: dropped {len(df) - n} trailing day(s) with <{int(min_cov * 100)}% coverage")
+    return df.iloc[:n]
+
+
 TV_EXCHANGES = {"sp500": ["NYSE", "NASDAQ", "AMEX"],
                 "nasdaq": ["NASDAQ", "NYSE", "AMEX"],
                 "sp600": ["NYSE", "NASDAQ", "AMEX"]}
@@ -296,9 +311,10 @@ def download_closes(tickers, tag, refresh=False, period="2y", source="yahoo",
         df = pd.concat(frames, axis=1)
         df = df.loc[:, ~df.columns.duplicated()]
         df = df.dropna(axis=1, thresh=int(len(df) * 0.6))
+    df = _trim_sparse_tail(df)
     with open(cp, "wb") as f:
         pickle.dump(df, f)
-    print(f"  [ok] {tag} ({source}): {df.shape[1]} names, {df.shape[0]} days")
+    print(f"  [ok] {tag} ({source}): {df.shape[1]} names, {df.shape[0]} days, through {df.index[-1].date()}")
     return df
 
 
@@ -416,7 +432,11 @@ def compute_breadth(closes, name, sub):
             if tv[max(0, j - 10):j + 1].min() < 0.40 and tv[j] > 0.615:
                 thr = True; break
     score_ts = composite_series(pct20, pct50, pct200, mcosc, net_nhnl, ad_line, vc)
-    L = -1
+    # Anchor the headline on the latest day with broad coverage (guards against a partial last bar).
+    good = vc >= max(1, 0.5 * closes.shape[1])
+    L = int(np.flatnonzero(good.values)[-1]) if good.any() else len(vc) - 1
+    if int(vc.iloc[L]) == 0 or pd.isna(score_ts.iloc[L]):
+        raise RuntimeError(f"{name}: no usable data on the latest day")
     b = Breadth(name=name, sub=sub, n=int(vc.iloc[L]),
                 pct_above_20=float(pct20.iloc[L]), pct_above_50=float(pct50.iloc[L]),
                 pct_above_200=float(pct200.iloc[L]),
