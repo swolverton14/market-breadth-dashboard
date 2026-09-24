@@ -249,18 +249,38 @@ def _tiingo_closes(tickers, tag, key, period_days=730, pause=0.15):
     return df.dropna(axis=1, thresh=int(len(df) * 0.6))
 
 
-def _trim_sparse_tail(df, min_cov=0.5):
-    """Drop trailing days where most tickers have no close yet.
-    Yahoo often returns the current day's bar for only a fraction of symbols
-    until it finalizes; computing breadth on that row gives nan / tiny counts."""
+def _expected_close_date():
+    """The most recent US trading date whose close should be available now (ET)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = dt.datetime.now()
+    d = now.date()
+    if (now.hour, now.minute) < (16, 30):      # before ~4:30pm ET today's close isn't in yet
+        d -= dt.timedelta(days=1)
+    while d.weekday() >= 5:                     # roll back over weekends
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def _trim_sparse_tail(df, min_cov=0.5, rel=0.85):
+    """Drop trailing days that are still half-loaded.
+    A day counts as complete when its ticker coverage is at least `rel` of the
+    universe's normal coverage (median of the prior ~20 days), with an absolute
+    floor of `min_cov`. Adaptive so thin universes (NASDAQ microcaps) aren't held
+    to an S&P-style 100% bar, while a genuinely partial day is still rejected."""
     if df is None or df.empty:
         return df
     cov = df.notna().mean(axis=1)
     n = len(df)
-    while n > 1 and cov.iloc[n - 1] < min_cov:
+    ref = float(cov.iloc[max(0, n - 21):n - 1].median()) if n > 5 else float(cov.max())
+    thr = max(min_cov, rel * ref)
+    while n > 1 and cov.iloc[n - 1] < thr:
         n -= 1
     if n < len(df):
-        print(f"    note: dropped {len(df) - n} trailing day(s) with <{int(min_cov * 100)}% coverage")
+        print(f"    note: dropped {len(df) - n} trailing day(s) below {thr:.0%} coverage "
+              f"(normal for this universe ≈ {ref:.0%})")
     return df.iloc[:n]
 
 
@@ -383,6 +403,7 @@ class Breadth:
     thrust_ratio: float; thrust_signal: bool
     score: float = 0.0; regime: str = ""
     key: str = ""; color: str = "var(--series-1)"
+    through: object = None   # date of the close the headline is anchored on
     series_pct200: list = field(default_factory=list)
     series_pct50: list = field(default_factory=list)
     series_adline: list = field(default_factory=list)
@@ -452,6 +473,7 @@ def compute_breadth(closes, name, sub):
     b.series_mcosc = _ser(idx, mcosc.iloc[-t:].values)
     b.series_nhnl = _ser(idx, net_nhnl.iloc[-t:].values)
     b.score_ts = score_ts.dropna()
+    b.through = pd.Timestamp(closes.index[L]).date()
     b.score = round(float(score_ts.iloc[L]), 1)
     if b.thrust_signal:
         b.score = round(min(100, b.score + 8), 1)
@@ -739,7 +761,7 @@ def render_body(indexes, risk, history, generated, note, sectors, backtest=None)
                        f'<span class="subval">{v:.0f}</span></div>' for k, v in b.components.items())
         thrust = '<span class="badge good">⚡ Breadth-thrust</span>' if b.thrust_signal else ""
         return f"""<section class="card"><div class="cardhead">
-          <div><h2>{b.name}</h2><div class="muted">{b.sub} · {b.n} stocks</div></div>
+          <div><h2>{b.name}</h2><div class="muted">{b.sub} · {b.n} stocks · through {b.through}</div></div>
           <div class="scorebox"><div class="bignum" style="color:{_sv(role)}">{b.score:.0f}</div>
           <div class="regime" style="color:{_sv(role)}">{b.regime}</div></div></div>
           <div class="regmsg"><span class="dot" style="background:{_sv(role)}"></span>{msg} {thrust}</div>
@@ -1073,7 +1095,8 @@ def _history(indexes, hist, price):
 
 
 def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
-          source="yahoo", tiingo_key=None, tv_user=None, tv_pass=None, artifact_path=None, years=2):
+          source="yahoo", tiingo_key=None, tv_user=None, tv_pass=None, artifact_path=None, years=2,
+          wait_today=0, wait_interval=15):
     indexes, sectors = [], None
     period = f"{max(int(years), 2)}y"
     if demo:
@@ -1093,26 +1116,48 @@ def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
         note = "DEMO / SYNTHETIC DATA — not real market data."
     else:
         print("Fetching constituents ...")
-        for spec in INDEX_SPECS:
-            try:
-                tickers = spec["fetch"]()
-                print(f"  {spec['name']}: {len(tickers)} names")
-                if sample:
-                    import random; random.seed(42)
-                    tickers = sorted(random.sample(tickers, min(sample, len(tickers))))
-                closes = download_closes(tickers, spec["key"], refresh=refresh, period=period, source=source,
-                                         tiingo_key=tiingo_key, tv_user=tv_user, tv_pass=tv_pass)
-                b = compute_breadth(closes, spec["name"], spec["sub"])
-                b.key, b.color = spec["key"], spec["color"]
-                indexes.append(b)
-                if spec["key"] == "sp500":
-                    sm = fetch_sp500_sectors()
-                    if sm:
-                        sectors = compute_sector_breadth(closes, sm)
-            except Exception as e:
-                print(f"  WARN: skipping {spec['name']} — {e}")
-        if not indexes:
-            raise RuntimeError("Could not build any index — every data source was blocked.")
+        expected = _expected_close_date()
+        ticker_cache = {}
+        attempt, waited = 0, 0
+        while True:
+            indexes, sectors = [], None
+            for spec in INDEX_SPECS:
+                try:
+                    if spec["key"] not in ticker_cache:
+                        tickers = spec["fetch"]()
+                        print(f"  {spec['name']}: {len(tickers)} names")
+                        if sample:
+                            import random; random.seed(42)
+                            tickers = sorted(random.sample(tickers, min(sample, len(tickers))))
+                        ticker_cache[spec["key"]] = tickers
+                    tickers = ticker_cache[spec["key"]]
+                    closes = download_closes(tickers, spec["key"], refresh=(refresh or attempt > 0),
+                                             period=period, source=source,
+                                             tiingo_key=tiingo_key, tv_user=tv_user, tv_pass=tv_pass)
+                    b = compute_breadth(closes, spec["name"], spec["sub"])
+                    b.key, b.color = spec["key"], spec["color"]
+                    indexes.append(b)
+                    if spec["key"] == "sp500":
+                        sm = fetch_sp500_sectors()
+                        if sm:
+                            sectors = compute_sector_breadth(closes, sm)
+                except Exception as e:
+                    print(f"  WARN: skipping {spec['name']} — {e}")
+            if not indexes:
+                raise RuntimeError("Could not build any index — every data source was blocked.")
+            # Anchor freshness on the S&P 500 (500 liquid names — reliably complete same-day).
+            # A lagging thin universe is shown with its own date instead of dragging everything back.
+            anchor = next((b for b in indexes if b.key == "sp500"), None)
+            latest = anchor.through if anchor else max(b.through for b in indexes)
+            if wait_today <= 0 or latest >= expected:
+                break
+            if waited + wait_interval > wait_today:
+                print(f"  Waited {waited} min; {expected} close still not complete — using data through {latest}.")
+                break
+            print(f"  Data through {latest}; waiting for {expected} close to finalize "
+                  f"(retry in {wait_interval} min, {wait_today - waited} min left) ...", flush=True)
+            time.sleep(wait_interval * 60)
+            waited += wait_interval; attempt += 1
         gspc = download_series("^GSPC", "gspc", refresh, period=f"{max(int(years) + 1, 3)}y")
         price = gspc.dropna().iloc[-(int(years) * 252 + 140):] if gspc is not None else None
         src = {"yahoo": "Yahoo Finance", "tiingo": "Tiingo", "tradingview": "TradingView"}.get(source, source)
@@ -1121,16 +1166,20 @@ def build(sample=None, refresh=False, demo=False, log=True, email_to=None,
                 + f" Source: {src} + FRED" + aux)
 
     risk = build_risk(refresh=refresh, demo=demo)
-    aligned = pd.concat([b.score_ts for b in indexes], axis=1).dropna()
+    # Union of dates (not intersection): a lagging index is forward-filled so one slow
+    # universe can never pull the headline date backwards.
+    aligned = pd.concat([b.score_ts for b in indexes], axis=1).sort_index().ffill().dropna()
     hist = aligned.mean(axis=1)
     history = _history(indexes, hist, price)
+    anchor = next((b for b in indexes if b.key == "sp500"), indexes[0])
+    history["through"] = str(anchor.through)
     backtest = compute_backtest(history)
     try:
         from zoneinfo import ZoneInfo
         ts = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%a %b %d, %Y %I:%M %p ET")
     except Exception:
         ts = dt.datetime.now().strftime("%a %b %d, %Y %H:%M")
-    data_through = history["dates"][-1] if history.get("dates") else "n/a"
+    data_through = history.get("through") or (history["dates"][-1] if history.get("dates") else "n/a")
     generated = f"Data through<br><b>{data_through} close</b><br>built {ts}"
 
     with open(OUT_HTML, "w", encoding="utf-8") as f:
@@ -1179,6 +1228,11 @@ def main():
                     help="also write a head/body-less variant for hosting")
     ap.add_argument("--years", type=int, default=2,
                     help="years of history to pull (bigger = longer backtest, slower download)")
+    ap.add_argument("--wait-today", type=int,
+                    default=int(os.environ.get("BREADTH_WAIT_TODAY",
+                                               "240" if os.environ.get("GITHUB_ACTIONS") else "0")),
+                    help="minutes to keep retrying until today's close is complete (default: 240 on "
+                         "GitHub Actions, 0 elsewhere)")
     args = ap.parse_args()
     if args.source == "tiingo" and not args.tiingo_key:
         ap.error("--source tiingo requires --tiingo-key or TIINGO_API_KEY")
@@ -1187,7 +1241,8 @@ def main():
               "consider --sample 150 for a first run.")
     out = build(sample=args.sample, refresh=args.refresh, demo=args.demo, log=not args.no_log,
                 email_to=args.email, source=args.source, tiingo_key=args.tiingo_key,
-                tv_user=args.tv_user, tv_pass=args.tv_pass, artifact_path=args.artifact, years=args.years)
+                tv_user=args.tv_user, tv_pass=args.tv_pass, artifact_path=args.artifact, years=args.years,
+                wait_today=args.wait_today)
     if not args.no_open and not args.email:
         try:
             webbrowser.open("file://" + os.path.abspath(out))
